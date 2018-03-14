@@ -5,7 +5,6 @@ authors = ["Drake Tetreault <drakeat@amazon.com>"]
 
 [dependencies]
 clap = "2.31"
-failure = "0.1"
 rand = "0.4"
 fine_grained = "0.1"
 
