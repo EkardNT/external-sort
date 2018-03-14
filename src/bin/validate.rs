@@ -42,7 +42,7 @@ fn validate<TRead: Read>(reader: &mut TRead) {
     for line in reader.lines() {
         match line {
             Ok(curr_line) => {
-                if !is_monotonically_increasing(&prev_line, &curr_line) {
+                if !(prev_line <= curr_line) {
                     writeln!(std::io::stderr(), "Found pair of lines that are not monotonically increasing: \"{}\" and \"{}\"", prev_line, curr_line).unwrap();
                     return;
                 }
@@ -57,8 +57,4 @@ fn validate<TRead: Read>(reader: &mut TRead) {
     }
 
     writeln!(std::io::stderr(), "Elapsed time: {duration}", duration = stopwatch).unwrap();
-}
-
-fn is_monotonically_increasing(prev: &str, curr: &str) -> bool {
-    prev <= curr
 }
