@@ -23,38 +23,43 @@ fn main() {
             .help("Path to the file which will be checked for correctness; if not present then the generated file will be written to standard output"))
         .get_matches();
 
-    if let Some(source_path) = matches.value_of("source") {
+    let exit_code = if let Some(source_path) = matches.value_of("source") {
         let mut file = File::open(source_path).expect("Unable to create destination file");
-        validate(&mut file);
+        validate(&mut file)
     } else {
         let mut stdin = ::std::io::stdin();
         let mut stdin_lock = stdin.lock();
-        validate(&mut stdin_lock);
-    }
+        validate(&mut stdin_lock)
+    };
+    std::process::exit(exit_code);
 }
 
-fn validate<TRead: Read>(reader: &mut TRead) {
+fn validate<TRead: Read>(reader: &mut TRead) -> i32 {
     let reader = BufReader::with_capacity(to_usize_saturating(MEGABYTE_SIZE), reader);
 
     let stopwatch = fine_grained::Stopwatch::start_new();
 
+    let mut curr_index = 1u64;
     let mut prev_line = String::new();
+
     for line in reader.lines() {
         match line {
             Ok(curr_line) => {
                 if !(prev_line <= curr_line) {
-                    writeln!(std::io::stderr(), "Found pair of lines that are not monotonically increasing: \"{}\" and \"{}\"", prev_line, curr_line).unwrap();
-                    return;
+                    writeln!(std::io::stderr(), "Lines {} and {} are not monotonically increasing: \"{}\" and \"{}\"", curr_index - 1, curr_index, prev_line, curr_line).unwrap();
+                    return 1;
                 }
                 prev_line.clear();
                 prev_line.push_str(&curr_line);
             }
             Err(error) => {
                 writeln!(std::io::stderr(), "Unable to read line: {}", error).unwrap();
-                return;
+                return 1;
             }
         }
+        curr_index += 1;
     }
 
     writeln!(std::io::stderr(), "Elapsed time: {duration}", duration = stopwatch).unwrap();
+    0
 }
