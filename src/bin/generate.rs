@@ -1,14 +1,17 @@
 extern crate clap;
+extern crate external_sort;
 extern crate fine_grained;
 extern crate rand;
 
-use std::io::{Write, BufWriter};
 use std::fs::File;
+use std::io::{Write, BufWriter};
 
 use clap::{Arg, App};
 use rand::{Rng, SeedableRng, XorShiftRng};
 use rand::os::OsRng;
 use rand::distributions::{IndependentSample, Range};
+
+use external_sort::conversions::{to_usize_saturating, to_u64_panicking};
 
 const LINE_LENGTH_WITH_NEWLINE : usize = 128;
 const MEGABYTE_SIZE : u64 = 1024 * 1024;
@@ -38,17 +41,17 @@ fn main() {
 
     if let Some(destination) = matches.value_of("destination") {
         let mut file = File::create(destination).expect("Unable to create destination file");
-        let mut writer = BufWriter::with_capacity(to_usize_saturating(MEGABYTE_SIZE), file);
-        generate(size_in_megabytes, &mut writer);
+        generate(size_in_megabytes, &mut file);
     } else {
-        let mut stdout = std::io::stdout();
+        let mut stdout = ::std::io::stdout();
         let mut stdout_lock = stdout.lock();
-        let mut writer = BufWriter::with_capacity(to_usize_saturating(MEGABYTE_SIZE), stdout_lock);
-        generate(size_in_megabytes, &mut writer);
+        generate(size_in_megabytes, &mut stdout_lock);
     }
 }
 
 fn generate<TWrite : Write>(size_in_megabytes: u64, writer: &mut TWrite) {
+    let mut writer = BufWriter::with_capacity(to_usize_saturating(MEGABYTE_SIZE), writer);
+
     let mut rng = create_prng();
     let mut line = create_blank_line_with_newline();
     let letter_range = Range::new('a' as u8, 'z' as u8);
@@ -85,21 +88,5 @@ fn create_blank_line_with_newline() -> [u8; LINE_LENGTH_WITH_NEWLINE] {
 fn fill_line<TRng: Rng>(line: &mut [u8], rng: &mut TRng, range: &Range<u8>) {
     for entry in line.iter_mut() {
         *entry = range.ind_sample(rng);
-    }
-}
-
-fn to_usize_saturating(num: u64) -> usize {
-    if (num as usize as u64) < num { 
-        std::usize::MAX
-    } else {
-        num as usize
-    }
-}
-
-fn to_u64_panicking(num: usize) -> u64 {
-    if (num as u64 as usize) != num {
-        panic!("Cannot losslessly convert usize value {} to u64", num);
-    } else {
-        num as u64
     }
 }
