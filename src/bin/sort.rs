@@ -1,10 +1,11 @@
 extern crate clap;
 extern crate external_sort;
 
+use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{Read, BufReader, BufRead, Write, BufWriter};
 use std::path::{Path, PathBuf};
-
+ 
 use clap::{App, Arg};
 
 const MEGABYTE_SIZE : usize = 1024 * 1024;
@@ -56,7 +57,7 @@ fn chunk_input(source_path: &Path) {
     let mut curr_entries_read = 0;
     let mut curr_bytes_read = 0;
 
-    let mut completed_chunks = Vec::with_capacity(50);
+    let mut completed_chunks = Vec::with_capacity(100);
 
     loop {
         let bytes_read = reader.read_until('\n' as u8, &mut chunk_data).expect("Failure while reading from source file");
@@ -75,11 +76,11 @@ fn chunk_input(source_path: &Path) {
             // Sorting in place here allows us to reuse the same chunk_data buffer over and over (fewer allocations),
             // but this won't work if we want to offload the sorting to a different thread. Once we do add dual-threading,
             // we'll need to allocate a new buffer for each chunk, so that we can pass the ownership to the sorting thread.
-            sort_chunk(&mut chunk_data[0..curr_bytes_read], &word_data[0..curr_entries_read]);
+            sort_chunk(&chunk_data[0..curr_bytes_read], &mut word_data[0..curr_entries_read]);
 
             // Note that not all of the chunk_data is written.
             let curr_path = path_for_chunk(source_path, curr_index);
-            write_chunk(&chunk_data[0..curr_bytes_read], &curr_path);
+            write_chunk(&chunk_data[0..curr_bytes_read], &word_data[..curr_entries_read], &curr_path);
 
             // Once we switch to dual-threading, we'll need to push this to a queue and signal the other thread.
             completed_chunks.push(Chunk {
@@ -113,11 +114,11 @@ fn chunk_input(source_path: &Path) {
         // Sorting in place here allows us to reuse the same chunk_data buffer over and over (fewer allocations),
         // but this won't work if we want to offload the sorting to a different thread. Once we do add dual-threading,
         // we'll need to allocate a new buffer for each chunk, so that we can pass the ownership to the sorting thread.
-        sort_chunk(&mut chunk_data[..curr_bytes_read], &word_data[..curr_entries_read]);
+        sort_chunk(&chunk_data[..curr_bytes_read], &mut word_data[..curr_entries_read]);
 
         // Note that not all of the chunk_data is written.
         let curr_path = path_for_chunk(source_path, curr_index);
-        write_chunk(&chunk_data[..curr_bytes_read], &curr_path);
+        write_chunk(&chunk_data[..curr_bytes_read], &word_data[..curr_entries_read], &curr_path);
 
         // Once we switch to dual-threading, we'll need to push this to a queue and signal the other thread.
         completed_chunks.push(Chunk {
@@ -125,6 +126,8 @@ fn chunk_input(source_path: &Path) {
             entries: curr_entries_read,
             bytes: curr_bytes_read
         });
+
+        println!("Finished chunk {}, wrote {} entries ({} bytes total)", curr_index, curr_entries_read, curr_bytes_read);
     }
 }
 
@@ -160,12 +163,120 @@ fn path_for_chunk(source_path: &Path, chunk_index: usize) -> PathBuf {
 }
 
 // Sorts data in place.
-fn sort_chunk(chunk_data: &mut [u8], word_data: &[Word]) {
-
+fn sort_chunk(chunk_data: &[u8], word_data: &mut [Word]) {
+    word_data.sort_unstable_by(|lhs, rhs| compare_words(chunk_data, lhs, rhs));
 }
 
-fn write_chunk(chunk_data: &[u8], curr_path: &Path) {
+// Tests whether the words 'lhs' and 'rhs' are lexicographically ordered.
+fn compare_words(chunk_data: &[u8], lhs: &Word, rhs: &Word) -> Ordering {
+    if lhs.raw_length < rhs.raw_length {
+        return Ordering::Less;
+    } 
+    if lhs.raw_length > rhs.raw_length {
+        return Ordering::Greater;
+    }
+
+    // Most significant byte is located at lowest offset.
+    for i in 0..lhs.raw_length {
+        let lhs_val = chunk_data[lhs.offset + i];
+        let rhs_val = chunk_data[rhs.offset + i];
+        if lhs_val < rhs_val {
+            return Ordering::Less;
+        }
+        if lhs_val > rhs_val {
+            return Ordering::Greater;
+        }
+    }
+
+    Ordering::Equal
+}
+
+fn write_chunk(chunk_data: &[u8], word_data: &[Word], curr_path: &Path) {
     let curr_file = File::create(&curr_path).expect("Unable to create chunk file");
     let mut curr_writer = BufWriter::with_capacity(WRITE_BUFFER_SIZE, curr_file);
-    curr_writer.write_all(chunk_data).expect("Failed to write chunk data");
+    for word in word_data {
+        curr_writer.write_all(&chunk_data[word.offset..(word.offset + word.raw_length)]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+    use super::compare_words;
+    use super::Word;
+
+    #[test]
+    fn compare_words_less() {
+        let cases = vec![
+            (vec![
+                0, '\n' as u8,
+                1, '\n' as u8
+            ], Word::new(0, 2), Word::new(2, 2)),
+            (vec![
+                0, 1, '\n' as u8,
+                0, 2, '\n' as u8
+            ], Word::new(0, 3), Word::new(3, 3)),
+            (vec![
+                13, 22, 74, '\n' as u8,
+                10, 12, 44, 32, '\n' as u8
+            ], Word::new(0, 4), Word::new(4, 5)),
+            (vec![
+                50, 44, 10, '\n' as u8,
+                50, 44, 11, '\n' as u8
+            ], Word::new(0, 4), Word::new(4, 4))
+        ];
+        for (ref chunk_data, ref lhs, ref rhs) in cases {
+            assert_eq!(Ordering::Less, compare_words(chunk_data, lhs, rhs));
+        }
+    }
+
+    #[test]
+    fn compare_words_greater() {
+        let cases = vec![
+            (vec![
+                1, '\n' as u8,
+                0, '\n' as u8
+            ], Word::new(0, 2), Word::new(2, 2)),
+            (vec![
+                0, 2, '\n' as u8,
+                0, 1, '\n' as u8
+            ], Word::new(0, 3), Word::new(3, 3)),
+            (vec![
+                10, 12, 44, 32, '\n' as u8,
+                13, 22, 74, '\n' as u8
+            ], Word::new(0, 5), Word::new(5, 4)),
+            (vec![
+                50, 44, 10, '\n' as u8,
+                10, 44, 11, '\n' as u8
+            ], Word::new(0, 4), Word::new(4, 4))
+        ];
+        for (ref chunk_data, ref lhs, ref rhs) in cases {
+            assert_eq!(Ordering::Greater, compare_words(chunk_data, lhs, rhs));
+        }
+    }
+
+    #[test]
+    fn compare_words_equal() {
+        let cases = vec![
+            (vec![
+                1, '\n' as u8,
+                1, '\n' as u8
+            ], Word::new(0, 2), Word::new(2, 2)),
+            (vec![
+                0, 2, '\n' as u8,
+                0, 2, '\n' as u8
+            ], Word::new(0, 3), Word::new(3, 3)),
+            (vec![
+                10, 12, 44, 32, '\n' as u8,
+                10, 12, 44, 32, '\n' as u8
+            ], Word::new(0, 5), Word::new(5, 5)),
+            (vec![
+                50, 44, 10, '\n' as u8,
+                50, 44, 10, '\n' as u8
+            ], Word::new(0, 4), Word::new(4, 4))
+        ];
+        for (ref chunk_data, ref lhs, ref rhs) in cases {
+            assert_eq!(Ordering::Equal, compare_words(chunk_data, lhs, rhs));
+        }
+    }
 }
