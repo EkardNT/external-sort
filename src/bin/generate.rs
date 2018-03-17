@@ -54,7 +54,7 @@ fn generate<TWrite : Write>(size_in_megabytes: u64, writer: &mut TWrite) {
 
     let mut rng = create_prng();
     let mut line = create_blank_line_with_newline();
-    let letter_range = Range::new('a' as u8, 'z' as u8);
+    let letter_range = Range::new('a' as u8, 'z' as u8 + 1);
 
     let stopwatch = fine_grained::Stopwatch::start_new();
 
