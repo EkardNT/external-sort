@@ -14,6 +14,7 @@ use clap::{App, Arg};
 const MEGABYTE_SIZE : usize = 1024 * 1024;
 const IO_BUFFER_SIZE : usize = 16 * MEGABYTE_SIZE;
 const CHUNK_MAX_SIZE : usize = 256 * MEGABYTE_SIZE;
+const MERGING_CHUNK_READ_BUFFER_COMBINED_MAX_SIZE : usize = 950 * MEGABYTE_SIZE;
 
 fn main() {
     let current_dir = ::std::env::current_dir();
@@ -144,13 +145,38 @@ fn chunk_input(source_path: &Path) -> Vec<Chunk> {
     completed_chunks
 }
 
+// Evenly split the total space for merge-phase read buffers among all chunk readers. The very
+// last chunk may get more space than the rest.
+fn compute_merge_read_buffer_sizes(chunk_count: usize) -> Vec<usize> {
+    let even_split = {
+        let split = MERGING_CHUNK_READ_BUFFER_COMBINED_MAX_SIZE / chunk_count;
+        if split >= MEGABYTE_SIZE { split } else { MEGABYTE_SIZE }
+    };
+    let remainder = {
+        let rem = MERGING_CHUNK_READ_BUFFER_COMBINED_MAX_SIZE - even_split * chunk_count;
+        if rem < 0 { 0 } else { rem }
+    };
+
+    let mut sizes = Vec::with_capacity(chunk_count);
+    // All except the last buffer get an even split.
+    for _ in 0..chunk_count-1 {
+        sizes.push(even_split);
+    }
+    // The very last buffer gets the remainder, if any.
+    sizes.push(even_split + remainder);
+
+    sizes
+}
+
 fn k_way_merge(destination_path: &Path, chunks: &Vec<Chunk>) {
     let file = File::create(destination_path).expect("Unable to create destination file");
     let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, file);
     
+    let merging_chunk_buffer_sizes = compute_merge_read_buffer_sizes(chunks.len());
     let merging_chunks: Vec<RefCell<MergingChunk>> = chunks.iter()
-        .map(|chunk| {
-            let mut merging_chunk = MergingChunk::new(chunk);
+        .zip(merging_chunk_buffer_sizes.iter())
+        .map(|(chunk, read_buffer_size)| {
+            let mut merging_chunk = MergingChunk::new(chunk, *read_buffer_size);
             // In addition to creating the MergingChunk, we also need to prime it by reading
             // the first line. But we ignore the result of reading the first line because
             // we simply don't add add an initial MergeCandidate for this MergingChunk to the
@@ -224,9 +250,9 @@ struct MergingChunk {
 }
 
 impl MergingChunk {
-    fn new(chunk: &Chunk) -> MergingChunk {
+    fn new(chunk: &Chunk, read_buffer_size: usize) -> MergingChunk {
         let file = File::open(&chunk.path).expect("Unable to open chunk file for merging");
-        let reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
+        let reader = BufReader::with_capacity(read_buffer_size, file);
         let head_data = Vec::with_capacity(1024);
         MergingChunk {
             reader,
