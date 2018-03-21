@@ -35,10 +35,6 @@ fn main() {
         .version("0.1.0")
         .author("Drake Tetreault <drakeat@amazon.com>")
         .about("Sorts large text files for CodeDeploy reading group project 1")
-        .arg(Arg::with_name("bucket")
-            .short("b")
-            .long("bucket")
-            .help("If present, allows bucket sorting to be used on inputs where every word is the same size"))
         .arg(Arg::with_name("source")
             .value_name("SOURCE_PATH")
             .index(1)
@@ -57,10 +53,8 @@ fn main() {
     let mut destination_path = current_dir.clone();
     destination_path.push(Path::new(matches.value_of("destination").expect("No destination path provided")));
 
-    let allow_bucket_sort = matches.is_present("bucket");
-
     let timer = fine_grained::Stopwatch::start_new();
-    let chunks = chunk_input(&source_path, allow_bucket_sort);
+    let chunks = chunk_input(&source_path);
     println!("Time to chunk input: {}", to_seconds(&timer));
     
     let timer = fine_grained::Stopwatch::start_new();
@@ -68,7 +62,7 @@ fn main() {
     println!("Time to k-way merge: {}", to_seconds(&timer));
 }
 
-fn chunk_input(source_path: &Path, allow_bucket_sort: bool) -> Vec<Chunk> {
+fn chunk_input(source_path: &Path) -> Vec<Chunk> {
     let file = File::open(source_path).expect("Unable to open source file");
     let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
 
@@ -105,8 +99,7 @@ fn chunk_input(source_path: &Path, allow_bucket_sort: bool) -> Vec<Chunk> {
                 &chunk_data[0..curr_bytes_read], 
                 &mut word_data[0..curr_entries_read],
                 line_min_length,
-                line_max_length,
-                allow_bucket_sort);
+                line_max_length);
             println!("Chunk sort time: {}", to_seconds(&timer));
             let timer = fine_grained::Stopwatch::start_new();
             // Note that not all of the chunk_data is written.
@@ -143,8 +136,7 @@ fn chunk_input(source_path: &Path, allow_bucket_sort: bool) -> Vec<Chunk> {
         // Record the read word. Its important to do this after any necessary chunk swap has happened because otherwise the
         // offset record in the word may be incorrect.
         let prefix_value = get_prefix_value(&chunk_data, curr_bytes_read, bytes_read);
-        let proxmap_bucket_index = proxmap_bucket_index_for_8192_buckets(prefix_value);
-        word_data.push(Word::new(curr_bytes_read, bytes_read, proxmap_bucket_index, prefix_value));
+        word_data.push(Word::new(curr_bytes_read, bytes_read, prefix_value));
 
         curr_bytes_read += bytes_read;
         curr_entries_read += 1;
@@ -166,8 +158,7 @@ fn chunk_input(source_path: &Path, allow_bucket_sort: bool) -> Vec<Chunk> {
             &chunk_data[..curr_bytes_read],
             &mut word_data[..curr_entries_read], 
             line_min_length, 
-            line_max_length,
-            allow_bucket_sort);
+            line_max_length);
 
         // Note that not all of the chunk_data is written.
         let curr_path = path_for_chunk(source_path, curr_index);
@@ -287,28 +278,17 @@ struct Chunk {
 struct Word {
     offset: usize,
     raw_length: usize,
-    proxmap_bucket_index: usize,
     prefix_value: usize
 }
 
 impl Word {
-    fn new(offset: usize, raw_length: usize, proxmap_bucket_index: usize, prefix_value: usize) -> Word {
+    fn new(offset: usize, raw_length: usize, prefix_value: usize) -> Word {
         assert!(raw_length >= 1, "Raw length cannot be because each word's raw length must cover \
             the mandatory '\\n' byte, even if the word is otherwise of length 0");
         Word {
             offset,
             raw_length,
-            proxmap_bucket_index,
             prefix_value
-        }
-    }
-
-    fn unset() -> Word {
-        Word {
-            offset: std::usize::MAX,
-            raw_length: std::usize::MAX,
-            proxmap_bucket_index: std::usize::MAX,
-            prefix_value: std::usize::MAX
         }
     }
 }
@@ -386,20 +366,13 @@ fn sort_chunk(
         chunk_data: &[u8],
         word_data: &mut [Word],
         line_min_length: usize,
-        line_max_length: usize,
-        allow_bucket_sort: bool) {
-    // For chunks where every line is the same length, we can use a special O(n) sort based on looking at the
-    // prefix of each line as an integer. I think this case should be able to also work for chunks where the
-    // difference between line lengths is <= the maximum number of bytes that can be stored in a u64. As each
-    // char holds 26 distinct values, a char corresponds to 5 bits (2^5 = 32), and floor(64 / 5) = 12, so the
-    // maximum spread possible should be 12 characters. For simplicity I'm not going to implement that now
-    // because the problem files are known to generate lines of the same length.
-    // NOTE: get_prefix_value will need to be made smarter if we want to allow for non-identically-sized word
-    // sorting.
-    if allow_bucket_sort && line_min_length == line_max_length {
-        bucket_sort(chunk_data, word_data, line_min_length, line_max_length)
-    } else {
-        // Otherwise, use the built-in O(n log(n)) comparison sort.
+        line_max_length: usize) {
+    // Note: previously I had implemented bucket sorting here if line_min_length == line_max_length, but once
+    // I added the optimization to look at prefix_value before calling compare_words, it turned out to have
+    // indistinguishable performance from the built-in sort. Alas.
+    // Note: oddly, performance is noticably improved by hoisting this line_min_length == line_max_length
+    // out of the lambda function.
+    if line_min_length == line_max_length {
         word_data.sort_unstable_by(|lhs, rhs| {
             if lhs.prefix_value < rhs.prefix_value {
                 Ordering::Less
@@ -411,7 +384,28 @@ fn sort_chunk(
                 compare_words(&chunk_data[lhs_range], &chunk_data[rhs_range])
             }
         });
+    } else {
+        word_data.sort_unstable_by(|lhs, rhs| {
+            // Even though not all the words are the same length, we can still get significant speedups by using the
+            // prefix value for lines that are the same length.
+            if lhs.raw_length == rhs.raw_length {
+                if lhs.prefix_value < rhs.prefix_value {
+                    Ordering::Less
+                } else if lhs.prefix_value > rhs.prefix_value {
+                    Ordering::Greater
+                } else {
+                    let lhs_range = lhs.offset..(lhs.offset + lhs.raw_length);
+                    let rhs_range = rhs.offset..(rhs.offset + rhs.raw_length);
+                    compare_words(&chunk_data[lhs_range], &chunk_data[rhs_range])
+                }
+            } else {
+                let lhs_range = lhs.offset..(lhs.offset + lhs.raw_length);
+                let rhs_range = rhs.offset..(rhs.offset + rhs.raw_length);
+                compare_words(&chunk_data[lhs_range], &chunk_data[rhs_range])
+            }
+        });
     }
+    
 }
 
 // Tests whether the words 'lhs' and 'rhs' are lexicographically ordered.
@@ -452,85 +446,6 @@ fn to_seconds(timer: &fine_grained::Stopwatch) -> f64 {
     timer.total_time() as f64 / NANOS_PER_SECOND
 }
 
-fn bucket_sort(chunk_data: &[u8], word_data: &mut [Word], line_min_length: usize, line_max_length: usize) {
-    const BUCKET_COUNT : usize = 8192;
-
-    // 10 * 1024 * 1024 words max / 8192 buckets = 1280 expected words/bucket on average.
-    let mut hit_counts = [0usize; BUCKET_COUNT];
-    for word in word_data.iter() {
-        hit_counts[word.proxmap_bucket_index] += 1;
-    }
-
-    // Compute prox maps aka proximity maps aka the index in the final array where each bucket begins.
-    let mut prox_maps = [std::usize::MAX; BUCKET_COUNT];
-    let mut running_sum = 0;
-    for i in 0..BUCKET_COUNT {
-        if hit_counts[i] > 0 {
-            prox_maps[i] = running_sum;
-            running_sum += hit_counts[i];
-        }
-    }
-
-    let mut sorted_words = vec![Word::unset(); word_data.len()];
-
-    // Write each word into its bucket. The difference from proxmap sort is we don't sort while inserting;
-    // instead we wait to do the per-bucket sort as the next step.
-    for word in word_data.iter() {
-        let insertion_index = prox_maps.get_mut(word.proxmap_bucket_index).unwrap();
-        sorted_words[*insertion_index] = *word;
-        *insertion_index = *insertion_index + 1;
-    }
-
-    // Sort each bucket
-    for i in 0..BUCKET_COUNT {
-        if hit_counts[i] > 0 {
-            let start = prox_maps[i] - hit_counts[i];
-            let end = prox_maps[i];
-            sorted_words[start..end].sort_unstable_by(|lhs, rhs| {
-                if lhs.prefix_value < rhs.prefix_value {
-                    Ordering::Less
-                } else if lhs.prefix_value > rhs.prefix_value {
-                    Ordering::Greater
-                } else {
-                    let lhs_range = lhs.offset..(lhs.offset + lhs.raw_length);
-                    let rhs_range = rhs.offset..(rhs.offset + rhs.raw_length);
-                    compare_words(&chunk_data[lhs_range], &chunk_data[rhs_range])
-                }
-            });
-        }
-    }
-
-    // Copy sorted words to output.
-    for i in 0..sorted_words.len() {
-        word_data[i] = sorted_words[i];
-    }
-}
-
-fn proxmap_bucket_index_for_8192_buckets(word_prefix_value: usize) -> usize {
-    // To map a word to a bucket, we'll take the first 13 (2^13=8192) most significant bits from 
-    // that words prefix.
-    const BITS_FOR_8192 : usize = 13;
-    const BITS_FOR_PREFIX : usize = PREFIX_MAX_LETTERS * BITS_PER_LETTER;
-    assert!(BITS_FOR_PREFIX > BITS_FOR_8192);
-    // Note that the prefix doesn't take up the full 64/32 bits necessarily, so its not right to
-    // calculate SHIFT_RIGHT_AMOUNT as 64 - 13. Instead, its (12 * 5) - 13 == 60 - 13 == 47.
-    const SHIFT_RIGHT_AMOUNT : usize = BITS_FOR_PREFIX - BITS_FOR_8192;
-
-    // NOTE: at this time, the maximum value for bucket_index is 6606 rather than 8191. This is
-    // because the value of 'z' in when converted to binary is '11001' rather than all-ones (11111).
-    // Thus, the buckets from 6607 to 8191 will never have any keys assigned.
-    let bucket_index = word_prefix_value >> SHIFT_RIGHT_AMOUNT;
-    
-    // TODO: test the performance with and without fully using all 8192 buckets. With this division,
-    // all buckets are used so the insertion sort phase works on smaller buckets, but on the other hand
-    // floating point math may be more expensive. Maybe its better to just eat the cost of the unused
-    // buckets?
-    let bucket_index = (bucket_index as f32) / 6606f32;
-    let bucket_index = (8191f32 * bucket_index).round() as usize;
-    
-    bucket_index
-}
-
 // Gets the prefix value for a word. The prefix value is the value of the most significant letters
 // for that word, not including the trailing '\n'. This function can handle words of less than the
 // number of letters that can fit inside a machine word (aka 12 for 64 bit, 6 for 32 bit).
@@ -562,7 +477,6 @@ fn get_prefix_value(chunk_data: &[u8], word_offset: usize, word_raw_length: usiz
 mod tests {
     use std::cmp::Ordering;
     use super::{compare_words, get_prefix_value};
-    use super::Word;
 
     #[test]
     fn compare_words_less() {
