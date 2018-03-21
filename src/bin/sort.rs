@@ -295,7 +295,8 @@ impl Word {
 
 struct MergingChunk {
     reader: BufReader<File>,
-    head_data: Vec<u8>
+    head_data: Vec<u8>,
+    prefix_value: usize
 }
 
 impl MergingChunk {
@@ -305,19 +306,21 @@ impl MergingChunk {
         let head_data = Vec::with_capacity(1024);
         MergingChunk {
             reader,
-            head_data
+            head_data,
+            prefix_value: std::usize::MAX
         }
     }
 
     fn try_read_next_head(&mut self) -> bool {
         self.head_data.clear();
         let bytes_read = self.reader.read_until('\n' as u8, &mut self.head_data).expect("Unable to read chunk file for merging");
-        bytes_read > 0
+        let has_new_line = bytes_read > 0;
+        self.prefix_value = if has_new_line { get_prefix_value(self.head_data.as_slice(), 0, bytes_read) } else { std::usize::MAX };
+        has_new_line
     }
 }
 
-// Represents a candidate 'head' line that the merge step is considering. The actual line data is stored in
-// the MergingChunk at merging_chunks[chunk_index]. Exactly one merge candidate exists for every MergingChunk.
+// Represents a candidate 'head' line that the merge step is considering.
 struct MergeCandidate<'a> {
     chunk_index: usize,
     merging_chunk: &'a RefCell<MergingChunk>
@@ -331,9 +334,20 @@ impl<'a> PartialEq for MergeCandidate<'a> {
     fn eq(&self, other: &Self) -> bool {
         let self_merging_chunk = self.merging_chunk.borrow();
         let other_merging_chunk = other.merging_chunk.borrow();
-        match compare_words(self_merging_chunk.head_data.as_slice(), other_merging_chunk.head_data.as_slice()) {
-            Ordering::Equal => true,
-            _ => false
+        if self_merging_chunk.head_data.len() == other_merging_chunk.head_data.len() {
+            if self_merging_chunk.prefix_value != other_merging_chunk.prefix_value {
+                false
+            } else {
+                match compare_words(self_merging_chunk.head_data.as_slice(), other_merging_chunk.head_data.as_slice()) {
+                    Ordering::Equal => true,
+                    _ => false
+                }
+            }
+        } else {
+            match compare_words(self_merging_chunk.head_data.as_slice(), other_merging_chunk.head_data.as_slice()) {
+                Ordering::Equal => true,
+                _ => false
+            }
         }
     }
 }
@@ -344,7 +358,17 @@ impl<'a> Ord for MergeCandidate<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
         let self_merging_chunk = self.merging_chunk.borrow();
         let other_merging_chunk = other.merging_chunk.borrow();
-        compare_words(self_merging_chunk.head_data.as_slice(), other_merging_chunk.head_data.as_slice()).reverse()
+        if self_merging_chunk.head_data.len() == other_merging_chunk.head_data.len() {
+            if self_merging_chunk.prefix_value < other_merging_chunk.prefix_value {
+                Ordering::Greater
+            } else if self_merging_chunk.prefix_value > other_merging_chunk.prefix_value {
+                Ordering::Less
+            } else {
+                compare_words(self_merging_chunk.head_data.as_slice(), other_merging_chunk.head_data.as_slice()).reverse()
+            }
+        } else {
+            compare_words(self_merging_chunk.head_data.as_slice(), other_merging_chunk.head_data.as_slice()).reverse()
+        }
     }
 }
 
